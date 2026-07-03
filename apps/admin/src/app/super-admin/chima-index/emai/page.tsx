@@ -1,8 +1,13 @@
 'use client';
 
-import { redirect } from 'next/navigation';
+import ChimaIndexDetail from '@/components/super-admin/ChimaIndexDetail';
 
-export default function Page() {
-  const parentPath = '/super-admin/' + '${dir}'.split('/')[0];
-  redirect(parentPath);
+export default function EMAIPage() {
+  return (
+    <ChimaIndexDetail
+      symbol="EMAI"
+      name="Emerging Markets Adoption Index"
+      blurb="Crypto adoption across Africa + LATAM + Caribbean — wallet growth, P2P volume, merchant acceptance, regulatory openness."
+    />
+  );
 }

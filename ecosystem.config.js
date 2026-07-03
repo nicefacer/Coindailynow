@@ -191,6 +191,35 @@ module.exports = {
     },
 
     // ============================================
+    // GOV MONITOR — polls regulator / central bank press feeds (P3.8)
+    // Emits high-priority alerts to Redis stream `gov_alerts:stream`
+    // and a recent-alerts list consumed by admin /api/admin/gov-alerts/recent.
+    // ============================================
+    {
+      name: 'coindaily-govmonitor',
+      cwd: './ai-system',
+      script: 'dist/workers/govMonitorRunner.js',
+      instances: 1,
+      exec_mode: 'fork',
+      env: {
+        NODE_ENV: 'production',
+        REDIS_URL: 'redis://localhost:6379',
+        GOV_MONITOR_INTERVAL_MS: '900000',
+        GOV_MONITOR_MAX_PER_SOURCE: '5',
+      },
+      error_file: './logs/govmonitor-error.log',
+      out_file: './logs/govmonitor-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      max_memory_restart: '300M',
+      autorestart: true,
+      watch: false,
+      max_restarts: 10,
+      min_uptime: '30s',
+      restart_delay: 5000,
+    },
+
+    // ============================================
     // IENGINE — AI VISUAL JOURNALISM WORKERS
     // GPU workers, upscale, thumbnail, delivery
     // ============================================

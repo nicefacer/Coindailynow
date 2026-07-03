@@ -1,8 +1,13 @@
 'use client';
 
-import { redirect } from 'next/navigation';
+import ChimaIndexDetail from '@/components/super-admin/ChimaIndexDetail';
 
-export default function Page() {
-  const parentPath = '/super-admin/' + '${dir}'.split('/')[0];
-  redirect(parentPath);
+export default function CRIPage() {
+  return (
+    <ChimaIndexDetail
+      symbol="CRI"
+      name="Crypto Remittance Index"
+      blurb="Cross-border crypto remittance corridor health — volume, settlement times, FX spreads across African and diaspora corridors."
+    />
+  );
 }

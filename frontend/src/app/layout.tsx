@@ -8,6 +8,7 @@ import CookieConsentBanner from '@/components/legal/CookieConsentBanner';
 import AppInstallAndOfflinePrompt from '@/components/pwa/AppInstallAndOfflinePrompt';
 import PostHogProvider from '@/components/providers/PostHogProvider';
 import { GeoProvider } from '@/lib/GeoContext';
+import LanguageUrlSync from '@/components/language/LanguageUrlSync';
 import CriticalCSS from '@/components/performance/CriticalCSS';
 import KeyboardShortcuts from '@/components/shortcuts/KeyboardShortcuts';
 import { DensityProvider } from '@/components/ui/DensityToggle';
@@ -263,6 +264,8 @@ export default function RootLayout({
             <AuthProvider>
               <PostHogProvider>
               <DensityProvider>
+              {/* P5.B4 — bridges header language dropdown → URL navigation */}
+              <LanguageUrlSync />
               <div id="main-content" role="main" className="min-h-screen">
                 {children}
               </div>

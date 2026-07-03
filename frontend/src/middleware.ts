@@ -43,8 +43,38 @@ const PUBLIC_ROUTES = [
   '/sw.js',
 ];
 
+// P5.B2 — languages we serve per-locale routes for. Must match the SUPPORTED_LANGS
+// set in /[country]/news/[slug] and /[country]/search pages.
+const SUPPORTED_LANGS = new Set([
+  'en', 'sw', 'fr', 'pt', 'ar', 'ha', 'ig', 'yo', 'zu', 'af', 'am', 'so', 'rw', 'es', 'ht', 'pcm',
+]);
+
+/** Resolve the reader's preferred language from cookie / Accept-Language / fallback. */
+function detectLang(request: NextRequest): string {
+  const cookieLang = request.cookies.get('lang')?.value;
+  if (cookieLang && SUPPORTED_LANGS.has(cookieLang)) return cookieLang;
+
+  const accept = request.headers.get('accept-language') || '';
+  for (const part of accept.split(',')) {
+    const code = part.split(';')[0].trim().slice(0, 2).toLowerCase();
+    if (SUPPORTED_LANGS.has(code)) return code;
+  }
+  return 'en';
+}
+
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
+
+  // P5.B2 — bare /news/<slug> → /<lang>/news/<slug> for SEO canonicalisation.
+  // Skip if the URL already begins with a known language prefix (handled by
+  // [country]/news/[slug] page).
+  const bareNewsMatch = pathname.match(/^\/news\/([^/]+)\/?$/);
+  if (bareNewsMatch) {
+    const lang = detectLang(request);
+    const redirectUrl = request.nextUrl.clone();
+    redirectUrl.pathname = `/${lang}/news/${bareNewsMatch[1]}`;
+    return NextResponse.redirect(redirectUrl, 301);
+  }
 
   if (pathname === '/' || pathname === '/news') {
     const headerCountry =

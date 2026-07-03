@@ -8,7 +8,9 @@ import { Express } from 'express';
 
 export function integrateIengineRoutes(app: Express): void {
   try {
-    const { default: iengineRouter } = require('../../Iengine/api/routes');
+    // Path is relative to the source file at backend/src/integrations/
+    // → ../../../Iengine/api/routes resolves to <monorepo>/Iengine/api/routes(.ts)
+    const { default: iengineRouter } = require('../../../Iengine/api/routes');
 
     app.use('/api/iengine', iengineRouter);
 

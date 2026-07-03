@@ -103,4 +103,44 @@ router.post('/:id/promote', async (req: Request, res: Response) => {
   }
 });
 
+// List all promotions across events
+router.get('/promotions/list', async (req: Request, res: Response) => {
+  try {
+    const status = req.query.status as string | undefined;
+    const { default: prisma } = await import('../../lib/prisma');
+    const where: any = {};
+    if (status) where.status = status;
+    const items = await (prisma as any).eventPromotion.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+      include: { event: { select: { id: true, title: true, slug: true, startDate: true, country: true } } },
+    });
+    res.json({ success: true, promotions: items, count: items.length });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List submissions (events pending moderation)
+router.get('/submissions/list', async (req: Request, res: Response) => {
+  try {
+    const status = (req.query.status as string) || 'PENDING';
+    const { default: prisma } = await import('../../lib/prisma');
+    const items = await (prisma as any).cryptoEvent.findMany({
+      where: { status },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+      select: {
+        id: true, title: true, slug: true, eventType: true, category: true, country: true,
+        startDate: true, organizerName: true, status: true, relevanceScore: true,
+        submissionSource: true, createdAt: true,
+      },
+    });
+    res.json({ success: true, submissions: items, count: items.length });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 export default router;

@@ -82,10 +82,17 @@ async function tryElasticsearch(
       },
     ];
 
-    const filterClauses: any[] = [{ term: { status: 'published' } }];
+    // P5.A4 — published status is uppercase in the per-language indexes
+    const filterClauses: any[] = [{ terms: { status: ['published', 'PUBLISHED'] } }];
     if (filters.category) filterClauses.push({ term: { category: filters.category } });
     if (filters.country) filterClauses.push({ term: { country: filters.country } });
-    if (filters.lang) filterClauses.push({ term: { language: filters.lang } });
+    // Language filter is now handled by routing to the right index (below),
+    // so we drop the language term clause when lang is set.
+    if (filters.lang && filters.lang === 'any') {
+      // Cross-language search: no term filter needed, query handles it via index wildcard
+    } else if (!filters.lang) {
+      // No lang specified — let the user see all languages (legacy index also matched)
+    }
 
     const body: any = {
       query: { bool: { must, filter: filterClauses } },
@@ -107,8 +114,22 @@ async function tryElasticsearch(
       },
     };
 
+    // P5.A4 — route to the per-language index when lang is specified.
+    //  - explicit lang → `coindaily_articles_<lang>` only
+    //  - lang='any' or unspecified → wildcard across every language index
+    //    AND the legacy single index, for backwards-compat during rollout.
+    const targetIndex =
+      filters.lang && filters.lang !== 'any'
+        ? `coindaily_articles_${filters.lang.toLowerCase()}`
+        : 'coindaily_articles_*,coindaily_articles';
+
     const start = Date.now();
-    const res = await client.search({ index: 'coindaily_articles', body });
+    const res = await client.search({
+      index: targetIndex,
+      body,
+      ignore_unavailable: true,   // index for a lang may not exist yet — return empty, don't 404
+      allow_no_indices: true,
+    } as any);
     const took = Date.now() - start;
 
     const totalVal = typeof res.hits.total === 'number' ? res.hits.total : res.hits.total?.value || 0;
@@ -325,6 +346,225 @@ router.get('/', async (req: Request, res: Response) => {
  *   q     - partial query (min 2 chars)
  *   limit - max suggestions (default 5)
  */
+/**
+ * P5.B1 — GET /api/v1/articles/by-slug?slug=X&lang=Y
+ *
+ * Direct lookup in the per-language ES index. Used by /<lang>/news/<slug>
+ * pages to fetch translated content. Returns first match (slug is unique
+ * per language). Falls back to Prisma if ES is unavailable.
+ *
+ * Mounted at /api/v1/search/by-slug (re-using this router's mount point)
+ * — clients should call /api/v1/search/by-slug?slug=...&lang=...
+ */
+router.get('/by-slug', async (req: Request, res: Response) => {
+  const slug = (req.query.slug as string || '').trim();
+  const lang = (req.query.lang as string || 'en').trim().toLowerCase();
+  if (!slug) return res.status(400).json({ error: 'slug required' });
+  if (!/^[a-z]{2,4}$/.test(lang)) return res.status(400).json({ error: 'invalid lang' });
+
+  try {
+    // ES first via languageIndexService
+    const { searchInLanguage } = await import('../../services/languageIndexService');
+    const esResult = await searchInLanguage({
+      language: lang,
+      query: '', // match-all; the slug filter is below
+    });
+    // searchInLanguage doesn't accept a slug filter today; do a manual term query
+    const { Client } = await import('@elastic/elasticsearch');
+    const esUrl = process.env.ELASTICSEARCH_URL || process.env.ELASTICSEARCH_NODE;
+    if (esUrl) {
+      try {
+        const client = new Client({ node: esUrl, requestTimeout: 5000 });
+        const r: any = await client.search({
+          index: `coindaily_articles_${lang}`,
+          body: {
+            size: 1,
+            query: { bool: { filter: [{ term: { slug } }] } },
+          },
+          ignore_unavailable: true,
+          allow_no_indices: true,
+        } as any);
+        const hit = r.hits.hits[0];
+        if (hit) {
+          return res.json({
+            source: 'elasticsearch',
+            language: lang,
+            article: {
+              articleId: hit._source.articleId,
+              translationId: hit._source.translationId,
+              isOriginal: hit._source.isOriginal,
+              slug: hit._source.slug,
+              title: hit._source.title,
+              excerpt: hit._source.excerpt,
+              content: hit._source.content,
+              featuredImageUrl: hit._source.featuredImageUrl,
+              publishedAt: hit._source.publishedAt,
+            },
+          });
+        }
+      } catch (esErr: any) {
+        logger.warn('[by-slug] ES lookup failed, falling back to Prisma', { err: esErr.message });
+      }
+    }
+
+    // Prisma fallback: find Article, prefer matching translation
+    const article = await prisma.article.findUnique({
+      where: { slug },
+      include: { ArticleTranslation: { where: { languageCode: lang } } },
+    });
+    if (!article || article.status !== 'PUBLISHED') {
+      return res.status(404).json({ error: 'not found' });
+    }
+    const translation = article.ArticleTranslation[0];
+    res.json({
+      source: 'prisma',
+      language: lang,
+      article: {
+        articleId: article.id,
+        translationId: translation?.id ?? null,
+        isOriginal: !translation,
+        slug: article.slug,
+        title: translation?.title || article.title,
+        excerpt: translation?.excerpt || article.excerpt,
+        content: translation?.content || article.content,
+        featuredImageUrl: article.featuredImageUrl,
+        publishedAt: article.publishedAt,
+      },
+    });
+  } catch (err: any) {
+    logger.error('[by-slug] failed', { err: err.message });
+    res.status(500).json({ error: 'by-slug failed', detail: err.message });
+  }
+});
+
+/**
+ * P5.B3 — GET /api/v1/search/by-language?lang=Y&page=N&limit=20
+ *
+ * List recent published articles available in a given language. Pulls from
+ * `coindaily_articles_<lang>` ordered by publishedAt desc; falls back to
+ * Prisma Article + ArticleTranslation if ES is down.
+ */
+router.get('/by-language', async (req: Request, res: Response) => {
+  const lang = (req.query.lang as string || '').trim().toLowerCase();
+  const page = Math.max(1, parseInt(req.query.page as string) || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string) || 20));
+  if (!/^[a-z]{2,4}$/.test(lang)) return res.status(400).json({ error: 'invalid lang' });
+
+  const from = (page - 1) * limit;
+
+  try {
+    const { Client } = await import('@elastic/elasticsearch');
+    const esUrl = process.env.ELASTICSEARCH_URL || process.env.ELASTICSEARCH_NODE;
+    if (esUrl) {
+      try {
+        const client = new Client({ node: esUrl, requestTimeout: 5000 });
+        const r: any = await client.search({
+          index: `coindaily_articles_${lang}`,
+          body: {
+            from,
+            size: limit,
+            query: { bool: { filter: [{ terms: { status: ['published', 'PUBLISHED'] } }] } },
+            sort: [{ publishedAt: { order: 'desc', missing: '_last' } }],
+          },
+          ignore_unavailable: true,
+          allow_no_indices: true,
+        } as any);
+        const totalVal = typeof r.hits.total === 'number' ? r.hits.total : r.hits.total?.value || 0;
+        return res.json({
+          source: 'elasticsearch',
+          language: lang,
+          page,
+          limit,
+          total: totalVal,
+          totalPages: Math.max(1, Math.ceil(totalVal / limit)),
+          hits: r.hits.hits.map((h: any) => ({
+            articleId: h._source.articleId,
+            translationId: h._source.translationId,
+            isOriginal: Boolean(h._source.isOriginal),
+            slug: h._source.slug,
+            title: h._source.title,
+            excerpt: h._source.excerpt,
+            featuredImageUrl: h._source.featuredImageUrl,
+            publishedAt: h._source.publishedAt,
+            category: h._source.category,
+          })),
+        });
+      } catch (esErr: any) {
+        logger.warn('[by-language] ES failed, falling back to Prisma', { err: esErr.message });
+      }
+    }
+
+    // Prisma fallback — union of (Article where language=lang) ∪ (ArticleTranslation where languageCode=lang)
+    const [originals, translations, originalsTotal, translationsTotal] = await Promise.all([
+      prisma.article.findMany({
+        where: { status: 'PUBLISHED', language: lang, deletedAt: null },
+        orderBy: { publishedAt: 'desc' },
+        skip: from,
+        take: limit,
+        select: {
+          id: true, slug: true, title: true, excerpt: true,
+          featuredImageUrl: true, publishedAt: true,
+        },
+      }),
+      prisma.articleTranslation.findMany({
+        where: { languageCode: lang, Article: { status: 'PUBLISHED', language: { not: lang } } },
+        orderBy: { Article: { publishedAt: 'desc' } },
+        skip: from,
+        take: limit,
+        select: {
+          id: true, articleId: true, title: true, excerpt: true,
+          Article: { select: { slug: true, featuredImageUrl: true, publishedAt: true } },
+        },
+      }),
+      prisma.article.count({ where: { status: 'PUBLISHED', language: lang, deletedAt: null } }),
+      prisma.articleTranslation.count({
+        where: { languageCode: lang, Article: { status: 'PUBLISHED', language: { not: lang } } },
+      }),
+    ]);
+
+    const hits = [
+      ...originals.map(a => ({
+        articleId: a.id,
+        translationId: null,
+        isOriginal: true,
+        slug: a.slug,
+        title: a.title,
+        excerpt: a.excerpt,
+        featuredImageUrl: a.featuredImageUrl,
+        publishedAt: a.publishedAt,
+      })),
+      ...translations.map(t => ({
+        articleId: t.articleId,
+        translationId: t.id,
+        isOriginal: false,
+        slug: t.Article.slug,
+        title: t.title,
+        excerpt: t.excerpt,
+        featuredImageUrl: t.Article.featuredImageUrl,
+        publishedAt: t.Article.publishedAt,
+      })),
+    ].sort((a, b) => {
+      const ta = a.publishedAt ? new Date(a.publishedAt).getTime() : 0;
+      const tb = b.publishedAt ? new Date(b.publishedAt).getTime() : 0;
+      return tb - ta;
+    }).slice(0, limit);
+
+    const total = originalsTotal + translationsTotal;
+    res.json({
+      source: 'prisma',
+      language: lang,
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+      hits,
+    });
+  } catch (err: any) {
+    logger.error('[by-language] failed', { err: err.message });
+    res.status(500).json({ error: 'by-language failed', detail: err.message });
+  }
+});
+
 router.get('/suggest', async (req: Request, res: Response) => {
   const q = (req.query.q as string || '').trim();
   if (q.length < 2) {

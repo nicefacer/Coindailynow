@@ -28,10 +28,22 @@ import ImageAgent from '../image/imageAgent';
 import TranslationAgentForReview from '../translation/translationAgentForReview';
 import { runSelfHostedEditorialReview } from './selfHostedEditorialReview';
 import { editorialPolicy } from '../../config/editorialPolicy';
+import {
+  createPipelineRun,
+  markRunReady,
+  markRunFailed,
+  StepRecorder,
+} from '../../orchestrator/stepRecorder';
+import { checkFacts, FactCheckResult } from '../research/factCheckAgent';
 
 // ============================================================================
 // TYPE DEFINITIONS
 // ============================================================================
+
+// (Local mirror — see ai-system/types/admin-types.ts for the canonical shape)
+interface ResearchOutcomeAugmented {
+  narrative_angles?: NarrativeAngles;
+}
 
 interface ResearchOutcome {
   id: string;
@@ -45,6 +57,8 @@ interface ResearchOutcome {
   trending_score: number; // 0-100
   timestamp: Date;
   raw_data: any;
+  /** P3.7 — research agent v2 narrative framing */
+  narrative_angles?: NarrativeAngles;
 }
 
 interface Source {
@@ -61,6 +75,49 @@ interface ValidationResult {
   issues: string[];
   suggestions: string[];
   metadata?: Record<string, any>;
+}
+
+/** P3.7 — narrative framing produced by the research agent for writer guidance */
+interface NarrativeAngles {
+  positive: string;
+  negative: string;
+  regional_relevance: Array<{ region: string; angle: string }>;
+}
+
+/**
+ * W4 — append explicit citation instructions to the writer prompt.
+ * The writer must cite each factual claim with [n] markers that resolve
+ * against the numbered source list. The doc editor renders these as
+ * footnote references via the FootnoteExtension; non-doc renderers see
+ * them as plain `[n]` text linking to the Sources section.
+ */
+/**
+ * P3.7 — append the positive/negative narrative angles + per-region framing
+ * so the writer agent produces editorially-positioned copy. Skipped silently
+ * when the research agent didn't generate angles (e.g. Ollama down).
+ */
+function appendNarrativeAngles(basePrompt: string, angles?: NarrativeAngles): string {
+  if (!angles) return basePrompt;
+
+  const regional = (angles.regional_relevance || [])
+    .map(r => `- ${r.region}: ${r.angle}`)
+    .join('\n');
+
+  const block = `\n\n---\nEDITORIAL ANGLES (CoinDaily narrative positioning):\nPRESENT BOTH SIDES. Lead with the positive framing, but explicitly address the negative angle in a "What to watch" or "Risk" paragraph. This is non-negotiable — single-angle pieces do not ship.\n\nPOSITIVE ANGLE:\n${angles.positive}\n\nNEGATIVE / RISK ANGLE:\n${angles.negative}\n\nREGIONAL RELEVANCE (cover the regions that apply; skip ones without an angle below):\n${regional || '(none)'}\n`;
+
+  return basePrompt + block;
+}
+
+function appendCitationInstructions(basePrompt: string, sources: Source[]): string {
+  if (!sources?.length) return basePrompt;
+
+  const numbered = sources
+    .map((s, i) => `[${i + 1}] ${s.title || s.domain || 'Source'} — ${s.url}`)
+    .join('\n');
+
+  const directive = `\n\n---\nCITATION REQUIREMENTS:\n- Cite EVERY factual claim, statistic, quote, and policy reference with a numbered marker like [1], [2], etc.\n- Use the source list below — each [n] refers to source #n.\n- Do NOT invent sources or use [n] markers that aren't in the list.\n- Multiple sources for one claim: [1][3].\n- The marker comes IMMEDIATELY after the cited claim, before punctuation: "Bitcoin adoption rose 40% [2]." not "Bitcoin adoption rose 40%. [2]"\n- Do NOT append a "References" or "Sources" section at the end — the platform renders that automatically.\n\nSOURCES (numbered for citation):\n${numbered}\n`;
+
+  return basePrompt + directive;
 }
 
 interface ArticleOutcome {
@@ -265,9 +322,19 @@ export class AIReviewAgent {
     });
 
     // Extract prompt string from result (may be string or string[])
-    const prompt = Array.isArray(result.prompt) ? result.prompt.join('\n\n') : result.prompt;
+    const basePrompt = Array.isArray(result.prompt) ? result.prompt.join('\n\n') : result.prompt;
 
-    console.log(`[Review Agent] ✅ Writing prompt generated (${prompt.length} chars)`);
+    // W4 — append citation instructions so the writer agent emits [n] markers
+    // tied to the numbered source list, and the doc editor can resolve them
+    // against the Sources section.
+    let prompt = appendCitationInstructions(basePrompt, research.sources);
+
+    // P3.7 — if the research agent produced narrative angles, surface them
+    // to the writer so the piece carries the platform's editorial framing
+    // (positive + negative angles, regional relevance for our 4 zones).
+    prompt = appendNarrativeAngles(prompt, research.narrative_angles);
+
+    console.log(`[Review Agent] ✅ Writing prompt generated (${prompt.length} chars, ${research.sources.length} cited sources)`);
 
     // Store prompt for later validation
     await this.redis.setex(
@@ -757,74 +824,180 @@ export class AIReviewAgent {
     console.log(`Topic: ${researchOutcome.topic}`);
     console.log(`${'='.repeat(80)}\n`);
 
+    const { runId, recorder } = await createPipelineRun(
+      this.prisma,
+      this.redis,
+      researchOutcome.topic,
+      this.isMockMode,
+    );
+    console.log(`[Review Agent] Pipeline run created: ${runId}`);
+
     try {
+      // STEP 0: Capture upstream research outcome (the trigger) for traceability
+      await recorder.record('research', 0, { trigger: 'research_agent' }, async () => researchOutcome);
+
       // STEP 1: Validate research
-      const researchValidation = await this.validateResearch(researchOutcome);
+      const researchValidation = await recorder.record(
+        'validateResearch',
+        1,
+        { topic: researchOutcome.topic, sourceCount: researchOutcome.sources?.length ?? 0 },
+        () => this.validateResearch(researchOutcome),
+      );
       if (!researchValidation.passed) {
         console.log(`[Review Agent] ❌ Research discarded (not newsworthy)`);
+        await markRunFailed(this.prisma, this.redis, runId, new Error('Research validation failed'));
         return null; // DISCARD
       }
 
-      // STEP 2: Get writing prompt from Imo
-      const writingPrompt = await this.requestWritingPrompt(researchOutcome);
+      // STEP 2 (P3.9): Fact-check claims against sources
+      const factCheck = await recorder.record(
+        'factCheck',
+        2,
+        { factCount: researchOutcome.facts?.length ?? 0, sourceCount: researchOutcome.sources?.length ?? 0 },
+        (metrics) => checkFacts(
+          {
+            facts: researchOutcome.facts || [],
+            sources: (researchOutcome.sources || []).map(s => ({
+              url: s.url,
+              title: s.title,
+              domain: s.domain,
+              summary: (s as any).summary,
+            })),
+            coreMessage: researchOutcome.core_message,
+            strictMode: true,
+          },
+          this.logger,
+          metrics,
+        ),
+      );
+      if (!this.shouldProceedAfterFactCheck(factCheck)) {
+        console.log(`[Review Agent] ❌ Fact-check FAILED: ${factCheck.unsupportedClaims}/${factCheck.totalClaims} unsupported (score ${factCheck.score}/100)`);
+        throw new Error(
+          `Fact-check failed: ${factCheck.unsupportedClaims} of ${factCheck.totalClaims} claims unsupported. Editor must re-research or edit the facts list.`,
+        );
+      }
+      console.log(`[Review Agent] ✅ Fact-check passed: ${factCheck.supportedClaims}/${factCheck.totalClaims} claims supported (score ${factCheck.score}/100)`);
 
-      // STEP 3: Send to Writer Agent (stub - actual agent would be called here)
+      // STEP 3: Get writing prompt from Imo
+      const writingPrompt = await recorder.record(
+        'writingPrompt',
+        3,
+        { topic: researchOutcome.topic },
+        () => this.requestWritingPrompt(researchOutcome),
+      );
+
+      // STEP 4: Send to Writer Agent
       console.log(`[Review Agent] → Sending to Writer Agent with Imo prompt`);
-      const article = await this.callWriterAgent(writingPrompt, researchOutcome);
+      const article = await recorder.record(
+        'writer',
+        4,
+        { writingPrompt },
+        () => this.callWriterAgent(writingPrompt, researchOutcome),
+      );
 
-      // STEP 4: Validate article
-      const articleValidation = await this.validateArticle(article, researchOutcome);
+      // STEP 5: Validate article
+      const articleValidation = await recorder.record(
+        'validateArticle',
+        5,
+        { articleId: article.id, wordCount: article.content?.length ?? 0 },
+        () => this.validateArticle(article, researchOutcome),
+      );
       if (!articleValidation.passed) {
         console.log(`[Review Agent] ❌ Article failed validation, requesting revision`);
-        // TODO: Request revision from Writer Agent
         throw new Error('Article validation failed');
       }
 
-      // STEP 5: Get image prompt from Imo
-      const imagePrompt = await this.requestImagePrompt(article, researchOutcome);
+      // STEP 6: Get image prompt from Imo
+      const imagePrompt = await recorder.record(
+        'imagePrompt',
+        6,
+        { articleTitle: article.title },
+        () => this.requestImagePrompt(article, researchOutcome),
+      );
 
-      // STEP 6: Send to Image Agent
+      // STEP 7: Send to Image Agent
       console.log(`[Review Agent] → Sending to Image Agent with Imo prompt`);
-      const image = await this.callImageAgent(imagePrompt, article);
+      const image = await recorder.record(
+        'image',
+        7,
+        { imagePrompt, articleId: article.id },
+        () => this.callImageAgent(imagePrompt, article),
+      );
 
-      // STEP 7: Validate image
-      const imageValidation = await this.validateImage(image, article);
+      // STEP 8: Validate image
+      const imageValidation = await recorder.record(
+        'validateImage',
+        8,
+        { imageId: image.id, themeMatch: image.theme_match_score, quality: image.quality_score },
+        () => this.validateImage(image, article),
+      );
       if (!imageValidation.passed) {
         console.log(`[Review Agent] ❌ Image failed validation, requesting regeneration`);
         throw new Error('Image validation failed');
       }
 
-      // STEP 8: Embed image in article
-      console.log(`[Review Agent] ✅ Embedding image in article`);
-      // Image embedding logic here
+      // STEP 9: Embed image in article
+      const articleWithImage = await recorder.record(
+        'embedImage',
+        9,
+        { articleId: article.id, imageId: image.id },
+        async () => this.embedImageInArticle(article, image),
+      );
 
-      // STEP 9: Get translation prompts from Imo (15 languages)
-      const translationPrompts = await this.requestTranslationPrompts(article, researchOutcome);
+      // STEP 10: Get translation prompts from Imo (15 languages)
+      const translationPrompts = await recorder.record(
+        'translationPrompts',
+        10,
+        { articleId: articleWithImage.id },
+        () => this.requestTranslationPrompts(articleWithImage, researchOutcome),
+      );
 
-      // STEP 10: Send to Translation Agent (simultaneous 15 translations)
+      // STEP 11: Send to Translation Agent (simultaneous 15 translations)
       console.log(`[Review Agent] → Sending to Translation Agent (15 languages simultaneously)`);
-      const translations = await this.callTranslationAgent(translationPrompts, article);
+      const translations = await recorder.record(
+        'translate',
+        11,
+        { articleId: articleWithImage.id, languageCount: translationPrompts.size },
+        () => this.callTranslationAgent(translationPrompts, articleWithImage),
+      );
 
-      // STEP 11: Validate translations
-      const translationValidation = await this.validateTranslations(translations, article);
+      // STEP 12: Validate translations
+      const translationValidation = await recorder.record(
+        'validateTranslations',
+        12,
+        { translationCount: translations.length },
+        () => this.validateTranslations(translations, articleWithImage),
+      );
       if (!translationValidation.passed) {
         console.log(`[Review Agent] ❌ Translations failed validation`);
         throw new Error('Translation validation failed');
       }
 
-      // STEP 12: Queue for admin approval
+      // STEP 13: Queue for admin approval
       const bundle: ArticleBundle = {
-        english: article,
+        english: articleWithImage,
         translations,
         image,
-        research: researchOutcome
+        research: researchOutcome,
       };
 
-      const queueItem = await this.queueForAdminApproval(bundle);
+      const queueItem = await recorder.record(
+        'queueForApproval',
+        13,
+        { articleId: articleWithImage.id },
+        () => this.queueForAdminApproval(bundle),
+      );
+
+      // Attach the run id to the queue item so the admin UI can fetch step history
+      (queueItem as any).pipeline_run_id = runId;
+
+      // Mark the run ready for human review (writes status + pushes onto admin_queue:pending)
+      await markRunReady(this.prisma, this.redis, runId);
 
       console.log(`\n${'='.repeat(80)}`);
       console.log(`[Review Agent] ✅ WORKFLOW COMPLETE`);
-      console.log(`Queue Item: ${queueItem.id}`);
+      console.log(`Run ID:      ${runId}`);
+      console.log(`Queue Item:  ${queueItem.id}`);
       console.log(`Articles Ready: 16 (1 English + 15 translations)`);
       console.log(`Status: Pending Admin Approval`);
       console.log(`${'='.repeat(80)}\n`);
@@ -833,8 +1006,70 @@ export class AIReviewAgent {
 
     } catch (error) {
       console.error(`[Review Agent] ❌ Workflow failed:`, error);
+      await markRunFailed(this.prisma, this.redis, runId, error);
       throw error;
     }
+  }
+
+  /**
+   * P3.9 — policy gate after the factCheck step. Three outcomes:
+   *   - check passed: proceed
+   *   - check failed but policy says soft-pass: log + proceed
+   *   - check failed and policy says block: return false → orchestrator throws
+   *
+   * The `fallback` case (Ollama down) honours editorialPolicy.factCheckSoftFailOnOutage
+   * separately, so a model outage doesn't block the queue unless explicitly required.
+   */
+  private shouldProceedAfterFactCheck(result: FactCheckResult): boolean {
+    if (result.passed) return true;
+
+    // Outage path
+    if (result.fallback) {
+      if (editorialPolicy.factCheckSoftFailOnOutage) {
+        console.warn(`[Review Agent] ⚠️  Fact-check unavailable; proceeding due to factCheckSoftFailOnOutage policy`);
+        return true;
+      }
+      // fall through to requireFactCheck check below
+    }
+
+    if (!editorialPolicy.requireFactCheck) {
+      console.warn(`[Review Agent] ⚠️  Fact-check failed but requireFactCheck=false; proceeding with warning`);
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * STEP 9 helper: embed the Iengine-generated image into the article body.
+   *
+   * The image is prepended to `content` as a markdown image reference.
+   * Both raw markdown renderers and the Tiptap doc converter (W3) parse
+   * this into a proper image node. Idempotent — if the image URL is
+   * already present in content, the article is returned unchanged.
+   */
+  private async embedImageInArticle(
+    article: ArticleOutcome,
+    image: ImageOutcome,
+  ): Promise<ArticleOutcome> {
+    if (!image.url) {
+      console.warn('[Review Agent] embedImage: image has no URL, skipping embed');
+      return article;
+    }
+
+    if (article.content.includes(image.url)) {
+      console.log('[Review Agent] embedImage: image already present in content, skipping');
+      return article;
+    }
+
+    const altText = (image.alt_text || article.title || 'Featured image').replace(/[\[\]()]/g, '');
+    const imageMarkdown = `![${altText}](${image.url})\n\n`;
+
+    console.log('[Review Agent] ✅ Embedding image in article');
+    return {
+      ...article,
+      content: imageMarkdown + article.content,
+    };
   }
 
   // Stub methods for calling other agents (to be implemented)

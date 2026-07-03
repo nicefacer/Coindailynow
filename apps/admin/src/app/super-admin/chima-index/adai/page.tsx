@@ -1,8 +1,13 @@
 'use client';
 
-import { redirect } from 'next/navigation';
+import ChimaIndexDetail from '@/components/super-admin/ChimaIndexDetail';
 
-export default function Page() {
-  const parentPath = '/super-admin/' + '${dir}'.split('/')[0];
-  redirect(parentPath);
+export default function ADAIPage() {
+  return (
+    <ChimaIndexDetail
+      symbol="ADAI"
+      name="African DeFi Activity Index"
+      blurb="Composite of on-chain DeFi activity across African markets — TVL, daily active wallets, transaction volume."
+    />
+  );
 }

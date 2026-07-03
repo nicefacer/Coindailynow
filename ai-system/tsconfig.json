@@ -24,7 +24,8 @@
     "types/**/*.ts",
     "config/**/*.ts",
     "src/**/*.ts",
-    "pipeline/**/*.ts"
+    "pipeline/**/*.ts",
+    "workers/**/*.ts"
   ],
   "exclude": [
     "node_modules",

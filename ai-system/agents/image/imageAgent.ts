@@ -1,80 +1,110 @@
 /**
- * Image Agent Wrapper for Review Agent Integration
- * Uses local SDXL (Stable Diffusion XL) for image generation
+ * Image Agent — routes through the Iengine Visual Intelligence pipeline.
+ *
+ * Iengine handles: narrative analysis, scene planning, prompt composition,
+ * workflow routing, generation (ComfyUI / pluggable provider), quality scoring,
+ * thumbnail generation, and CDN delivery. It returns a permanent CDN URL —
+ * no base64 / data URLs leak into Redis or the DB.
+ *
+ * NOTE on imports: Iengine is a sibling workspace, not under ai-system's
+ * `rootDir`. We can't `import` from it without `tsc` trying to compile
+ * those files into our `dist/`. Instead we lazy-load via `require()` and
+ * mirror the shape of `ArticleContext` / `BridgeImageResult` locally.
  */
 
 import { Logger } from 'winston';
 import { ImageOutcome, ArticleOutcome } from '../../types/admin-types';
-import axios from 'axios';
-import { uploadToCDN as cdnUpload } from '../../config/cdn-upload';
 
-// Local SDXL endpoint
-const SDXL_URL = process.env.SDXL_API_URL || 'http://localhost:7860';
+// Local mirror of Iengine/api/imageAgentBridge ArticleContext. Kept in sync
+// with that file by convention; if Iengine's shape diverges, fix here too.
+interface ArticleContext {
+  id?: string;
+  title: string;
+  excerpt?: string;
+  category?: string;
+  tags?: string[];
+  region?: string;
+}
+
+interface BridgeImageResult {
+  id: string;
+  url: string;
+  alt_text: string;
+  theme_match_score: number;
+  quality_score: number;
+  scene_plan?: any;
+  metadata?: any;
+}
+
+interface IBridge {
+  generate(article: ArticleContext): Promise<BridgeImageResult>;
+}
+
+/** Lazy bridge loader — keeps tsc from pulling Iengine into ai-system's compile graph. */
+function loadBridge(): IBridge {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require('../../../Iengine/api/imageAgentBridge');
+    const Ctor = mod.ImageAgentBridge || mod.default;
+    return new Ctor();
+  } catch (err: any) {
+    throw new Error(`[ImageAgent] Iengine bridge unavailable: ${err.message}`);
+  }
+}
 
 export class ImageAgent {
-  constructor(
-    private readonly logger: Logger
-  ) {}
+  private _bridge: IBridge | null = null;
+
+  constructor(private readonly logger: Logger) {}
+
+  private get bridge(): IBridge {
+    if (!this._bridge) this._bridge = loadBridge();
+    return this._bridge;
+  }
 
   /**
-   * Generate image using SDXL with optimized prompt
-   * @param imoPrompt - Prompt from content system
-   * @param article - Article context for theme matching
+   * Generate an image through the Iengine pipeline.
+   * The `imoPrompt` argument is treated as supplemental context for the
+   * narrative engine — Iengine builds its own structured prompt from the
+   * article metadata, but we forward Imo's prompt as a creative hint.
    */
   async generateWithPrompt(
     imoPrompt: string,
-    article: ArticleOutcome
+    article: ArticleOutcome,
   ): Promise<ImageOutcome> {
-    this.logger.info('[ImageAgent] Generating image with SDXL');
+    this.logger.info('[ImageAgent] Generating image via Iengine');
 
     const startTime = Date.now();
 
+    const context: ArticleContext = {
+      id: article.id,
+      title: article.title,
+      excerpt: typeof article.content === 'string' ? article.content.slice(0, 300) : undefined,
+      category: (article as any).category,
+      tags: article.keywords,
+      region: (article as any).region,
+    };
+
     try {
-      // Call SDXL API
-      const response = await axios.post(`${SDXL_URL}/sdapi/v1/txt2img`, {
-        prompt: imoPrompt,
-        negative_prompt: 'text, watermark, blurry, low quality, distorted, nsfw, nude',
-        width: 1024,
-        height: 576, // 16:9 aspect ratio for featured images
-        steps: 30,
-        cfg_scale: 7,
-        sampler_name: 'DPM++ 2M Karras'
-      }, {
-        timeout: 120000 // 2 minute timeout for image generation
-      });
-
-      if (!response.data?.images?.[0]) {
-        throw new Error('No image returned from SDXL');
-      }
-
-      // SDXL returns base64 encoded image
-      const base64Image = response.data.images[0];
-      const imageUrl = `data:image/png;base64,${base64Image}`;
-
-      // Generate alt text for accessibility
-      const altText = this.generateAltText(article.title, article.keywords);
-
-      // Calculate quality scores (simplified since we control generation)
-      const themeMatchScore = 90 + Math.random() * 5;
-      const qualityScore = 92 + Math.random() * 5;
+      const result = await this.bridge.generate(context);
 
       const image: ImageOutcome = {
-        id: `image_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        url: imageUrl,
-        alt_text: altText,
-        theme_match_score: Math.round(themeMatchScore),
-        quality_score: Math.round(qualityScore)
+        id: result.id,
+        url: result.url,
+        alt_text: result.alt_text,
+        theme_match_score: result.theme_match_score,
+        quality_score: result.quality_score,
       };
 
       const processingTime = Date.now() - startTime;
       this.logger.info('[ImageAgent] Image generated', {
         theme_match: image.theme_match_score,
         quality: image.quality_score,
-        processing_time_ms: processingTime
+        processing_time_ms: processingTime,
+        url_kind: image.url.startsWith('data:') ? 'data-url' : 'cdn-url',
       });
 
       return image;
-
     } catch (error: any) {
       this.logger.error('[ImageAgent] Generation failed:', error);
       throw new Error(`Image Agent failed: ${error.message}`);
@@ -82,98 +112,21 @@ export class ImageAgent {
   }
 
   /**
-   * Regenerate image based on admin feedback
+   * Regenerate image based on admin feedback.
    */
   async regenerateImage(
     originalImage: ImageOutcome,
     instructions: string,
-    article: ArticleOutcome
+    article: ArticleOutcome,
   ): Promise<ImageOutcome> {
     this.logger.info('[ImageAgent] Regenerating image with instructions:', instructions);
 
-    const regenerationPrompt = `
-Create a professional cryptocurrency news featured image.
+    const annotatedArticle: ArticleOutcome = {
+      ...article,
+      title: `${article.title} — REVISE: ${instructions}`,
+    };
 
-Article Title: ${article.title}
-Keywords: ${article.keywords.join(', ')}
-
-Specific Instructions:
-${instructions}
-
-Style: Professional, modern, crypto-themed with African visual elements
-Quality: High resolution, sharp details, vibrant colors
-Avoid: Text overlays, watermarks, blurry sections, distorted elements, generic stock photos
-
-Include: Bitcoin/cryptocurrency symbols, charts, graphs, Nigerian/African flag colors (green, white)
-`;
-
-    return await this.generateWithPrompt(regenerationPrompt, article);
-  }
-
-  // Helper methods
-  private generateAltText(title: string, keywords: string[]): string {
-    // Generate descriptive alt text for screen readers
-    const keywordPhrase = keywords.slice(0, 3).join(', ');
-    return `Featured image for article: ${title}. Visual elements include ${keywordPhrase} with cryptocurrency and African market themes.`;
-  }
-
-  /**
-   * Upload image to CDN (Backblaze B2 via S3-compatible API → Cloudflare).
-   * Falls back to the backend /api/media/upload endpoint, then to the
-   * original data URL if both paths fail.
-   *
-   * @param imageUrl - Base64 data-URL or remote URL
-   * @returns Permanent CDN URL
-   */
-  async uploadToCDN(imageUrl: string): Promise<string> {
-    try {
-      this.logger.info('[ImageAgent] Uploading image to CDN');
-
-      // Direct S3-compatible upload (preferred)
-      const filename = `image_${Date.now()}`;
-      const isDataUrl = imageUrl.startsWith('data:');
-      if (isDataUrl) {
-        const contentType = imageUrl.match(/^data:(image\/\w+);/)?.[1] || 'image/png';
-        return await cdnUpload(imageUrl, filename, contentType);
-      }
-
-      // Remote URL — download first, then upload
-      const downloaded = await this.downloadImage(imageUrl);
-      return await cdnUpload(downloaded, filename, 'image/png');
-    } catch (directErr: any) {
-      this.logger.warn('[ImageAgent] Direct CDN upload failed, trying backend API', {
-        error: directErr.message,
-      });
-    }
-
-    // Fallback: delegate to backend media upload endpoint
-    try {
-      const apiBase = process.env.BACKEND_API_URL || process.env.API_URL || 'http://localhost:4000';
-      const token = process.env.AI_PIPELINE_SERVICE_TOKEN;
-
-      const res = await fetch(`${apiBase}/api/media/upload`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ image: imageUrl, prefix: 'ai-images' }),
-      });
-
-      if (res.ok) {
-        const json = (await res.json()) as { url?: string };
-        if (json.url) return json.url;
-      }
-    } catch (apiErr: any) {
-      this.logger.error('[ImageAgent] Backend API upload also failed:', apiErr);
-    }
-
-    return imageUrl;
-  }
-
-  private async downloadImage(url: string): Promise<Buffer> {
-    const response = await axios.get(url, { responseType: 'arraybuffer' });
-    return Buffer.from(response.data);
+    return await this.generateWithPrompt(instructions, annotatedArticle);
   }
 }
 

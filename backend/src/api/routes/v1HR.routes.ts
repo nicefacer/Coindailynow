@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import hrService from '../../services/hrService';
+import prisma from '../../lib/prisma';
 
 const router = Router();
 
@@ -29,6 +30,33 @@ router.post('/vacancies', async (req: Request, res: Response) => {
 });
 
 // Applications
+router.get('/applications', async (req: Request, res: Response) => {
+  try {
+    const stage = req.query.stage as string | undefined;
+    const vacancyId = req.query.vacancyId as string | undefined;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+
+    const where: any = {};
+    if (stage) where.stage = stage;
+    if (vacancyId) where.vacancyId = vacancyId;
+
+    const [items, total] = await Promise.all([
+      prisma.jobApplication.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+        include: { vacancy: { select: { title: true, department: true } } } as any,
+      }),
+      prisma.jobApplication.count({ where }),
+    ]);
+    res.json({ success: true, applications: items, total, page, limit, totalPages: Math.ceil(total / limit) });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.post('/applications', async (req: Request, res: Response) => {
   try {
     const application = await hrService.submitApplication(req.body);
@@ -68,6 +96,23 @@ router.post('/applications/:id/interview', async (req: Request, res: Response) =
 });
 
 // Onboarding
+router.get('/onboarding', async (req: Request, res: Response) => {
+  try {
+    const status = req.query.status as string | undefined;
+    const where: any = {};
+    if (status) where.status = status;
+
+    const items = await prisma.staffOnboarding.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+    res.json({ success: true, onboarding: items, count: items.length });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.post('/onboarding', async (req: Request, res: Response) => {
   try {
     const { userId, applicationId } = req.body;

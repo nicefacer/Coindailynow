@@ -92,6 +92,18 @@ import botRouter from './routes/bot.routes';
 import { startMLRetrainingLoop } from './agents/AdsRotationAgent';
 import { integrateAIRegistryRoutes } from './integrations/aiRegistryIntegration';
 import { integrateIengineRoutes } from './integrations/iengineIntegration';
+import pipelineRunRoutes from './api/admin/pipelineRunRoutes';
+import govAlertsRoutes from './api/admin/govAlertsRoutes';
+import pipelineSettingsRoutes from './api/admin/pipelineSettingsRoutes';
+import videoRunRoutes from './api/admin/videoRunRoutes';
+import distributionRoutes from './api/admin/distributionRoutes';
+import { startDistributionDispatcher } from './services/distribution/distributionDispatcher';
+import { startMetricsWorker } from './services/distribution/metricsWorker';
+import { attachCollabServer } from './services/collabServer';
+import { startGovAlertConsumer } from './services/govAlertConsumer';
+import { startPipelineSeedConsumer } from './services/pipelineSeedConsumer';
+import { startScheduledPublisher } from './services/scheduledPublisher';
+import { getRedis } from './lib/redis';
 import { startScheduler as startNewsScheduler, registerNewsHandler } from './services/newsScheduler';
 import { startPipelineScheduler as startAnalysisScheduler } from './services/dataAnalysisPipeline';
 import { MarketDataAggregator } from './services/marketDataAggregator';
@@ -520,6 +532,21 @@ export async function setupApp() {
   // Iengine — AI Visual Journalism Intelligence Engine
   integrateIengineRoutes(app);
 
+  // Editorial pipeline runs — doc-based review surface (Phase 1)
+  app.use('/api/admin/pipeline-runs', pipelineRunRoutes);
+
+  // Government announcement alerts — surfaced from the GovMonitor worker (P3.8)
+  app.use('/api/admin/gov-alerts', govAlertsRoutes);
+
+  // Pipeline runtime settings (P4.4)
+  app.use('/api/admin/pipeline-settings', pipelineSettingsRoutes);
+
+  // Video pipeline review (P6.7)
+  app.use('/api/admin/video-runs', videoRunRoutes);
+
+  // Distribution admin + dispatcher (P7)
+  app.use('/api/admin/distribution', distributionRoutes);
+
   // Ads Management & Rotation Agent Routes (DeepSeek R1-powered ad engine)
   app.use('/api/ads', adsRotationRouter);
   startMLRetrainingLoop();
@@ -621,6 +648,45 @@ export async function setupApp() {
     path: GRAPHQL_PATH,
   });
   const serverCleanup = useServer({ schema, context }, wsServer);
+
+  // Editorial doc collab — Hocuspocus on /collab (Phase 1)
+  attachCollabServer(httpServer);
+
+  // P3.5 B — consume gov_alerts:stream + drain gov_alerts:promoted
+  // and enqueue editorial pipeline seeds.
+  try {
+    startGovAlertConsumer(getRedis() as any);
+  } catch (err: any) {
+    console.warn('[backend] govAlertConsumer not started:', err.message);
+  }
+
+  // P4.1 — consume pipeline_runs:queue and trigger orchestrateArticleCreation.
+  try {
+    startPipelineSeedConsumer(getRedis() as any);
+  } catch (err: any) {
+    console.warn('[backend] pipelineSeedConsumer not started:', err.message);
+  }
+
+  // P4.2 — poll Articles with SCHEDULED status and flip to PUBLISHED at the right time
+  try {
+    startScheduledPublisher();
+  } catch (err: any) {
+    console.warn('[backend] scheduledPublisher not started:', err.message);
+  }
+
+  // P7.2 — consume distribution:queue and fan out to all enabled targets
+  try {
+    startDistributionDispatcher(getRedis() as any);
+  } catch (err: any) {
+    console.warn('[backend] distributionDispatcher not started:', err.message);
+  }
+
+  // P8.4 — periodically poll platform APIs for distribution metrics
+  try {
+    startMetricsWorker();
+  } catch (err: any) {
+    console.warn('[backend] metricsWorker not started:', err.message);
+  }
 
   // Dedicated market stream endpoint: WS /api/v1/stream/:symbol
   const marketStreamWss = new WebSocketServer({ noServer: true });

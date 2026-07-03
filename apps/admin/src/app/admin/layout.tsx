@@ -33,7 +33,11 @@ import {
   Crown,
   ShoppingCart,
   Send,
-  Monitor
+  Monitor,
+  Sparkles,
+  Radio,
+  Film,
+  Share2,
 } from 'lucide-react';
 
 // Navigation items with role-based access control (S1-3)
@@ -57,6 +61,10 @@ const navItems: NavItem[] = [
   { href: '/admin', label: 'Dashboard', icon: LayoutDashboard, exact: true },
   { href: '/admin/users', label: 'User Management', icon: Users, requiredRoles: ['SUPER_ADMIN', 'ADMIN', 'CEO'] },
   { href: '/admin/content', label: 'Content', icon: FileText, requiredRoles: CONTENT_ROLES },
+  { href: '/admin/editorial-pipeline', label: 'Editorial Pipeline', icon: Sparkles, requiredRoles: CONTENT_ROLES },
+  { href: '/admin/videos', label: 'Video Pipeline', icon: Film, requiredRoles: CONTENT_ROLES },
+  { href: '/admin/distribution', label: 'Distribution', icon: Share2, requiredRoles: CONTENT_ROLES },
+  { href: '/admin/gov-alerts', label: 'Gov Wire', icon: Radio, requiredRoles: CONTENT_ROLES },
   { href: '/admin/marquees', label: 'Marquee', icon: Monitor, requiredRoles: CONTENT_ROLES },
   { href: '/admin/moderation/emergency', label: 'Emergency Moderation', icon: Shield, requiredRoles: ['EDITOR', 'CEO', 'CONTENT_ADMIN', 'ADMIN', 'SUPER_ADMIN'] },
   { href: '/admin/ai', label: 'AI Management', icon: Brain, requiredRoles: [...CONTENT_ROLES, 'TECH_ADMIN'] },
@@ -71,6 +79,8 @@ const navItems: NavItem[] = [
   { href: '/admin/audit', label: 'Audit Logs', icon: Eye, requiredRoles: ['SUPER_ADMIN', 'ADMIN', 'CEO'] },
   { href: '/admin/system', label: 'System Health', icon: Monitor, requiredRoles: TECH_ROLES },
   { href: '/admin/settings', label: 'Settings', icon: Settings, requiredRoles: ['SUPER_ADMIN', 'ADMIN', 'CEO'] },
+  { href: '/admin/settings/pipeline', label: 'Pipeline Settings', icon: Sparkles, requiredRoles: ['EDITOR', 'CEO', 'CONTENT_ADMIN', 'ADMIN', 'SUPER_ADMIN'] },
+  { href: '/admin/settings/setup-checklist', label: 'Setup Checklist', icon: Settings, requiredRoles: ['CEO', 'ADMIN', 'SUPER_ADMIN'] },
   { href: '/admin/finance', label: 'CFIS Finance', icon: DollarSign, requiredRoles: ['SUPER_ADMIN', 'ADMIN', 'CEO'] },
   { href: '/admin/fraud-alerts', label: 'Fraud Alerts', icon: Shield, requiredRoles: TECH_ROLES },
 ];

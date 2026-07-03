@@ -14,6 +14,12 @@ export interface ResearchOutcome {
   trending_score: number; // 0-100
   timestamp: Date;
   raw_data: any;
+  /** P3.7 — positive + negative editorial framing for narrative control */
+  narrative_angles?: {
+    positive: string;
+    negative: string;
+    regional_relevance: Array<{ region: string; angle: string }>;
+  };
 }
 
 export interface Source {

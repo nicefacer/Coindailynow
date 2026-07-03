@@ -96,13 +96,18 @@ const nextConfig = {
 
   // Webpack optimization
   webpack: (config, { buildId, dev, isServer, defaultLoaders, webpack }) => {
-    // Production optimizations
-    if (!dev) {
+    // Production optimizations — CLIENT BUNDLE ONLY.
+    // The previous code applied the custom splitChunks to the server bundle as
+    // well, which forced browser-only deps (posthog-js etc.) into a single
+    // server-side vendors.js where their top-level `self.X = ...` crashed at
+    // build time with "ReferenceError: self is not defined". Server bundling
+    // is left to Next.js defaults.
+    if (!dev && !isServer) {
       // Tree shaking optimization
       config.optimization.usedExports = true;
       config.optimization.sideEffects = false;
-      
-      // Bundle splitting
+
+      // Bundle splitting (client only)
       config.optimization.splitChunks = {
         chunks: 'all',
         cacheGroups: {

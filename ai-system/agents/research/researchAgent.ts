@@ -18,6 +18,9 @@
 import { Logger } from 'winston';
 import { PrismaClient } from '@prisma/client';
 import { ResearchOutcome, Source } from '../../types/admin-types';
+import { fetchAllRegionalSources, FetchedArticle } from './regionalFetcher';
+import { generateNarrativeAngles, NarrativeAngles } from './narrativeAngleAgent';
+import { planResearch } from './plannerAgent';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -134,6 +137,7 @@ export class ResearchAgent {
       rssResult,
       trendResult,
       regulatoryResult,
+      multiRegionResult,
     ] = await Promise.allSettled([
       this.fetchBackendNews(),
       this.fetchRegionalNews(),
@@ -141,6 +145,7 @@ export class ResearchAgent {
       this.fetchRssAggregation(),
       this.fetchTrendAnalysis(),
       this.fetchAfricanRegulatoryData(),
+      fetchAllRegionalSources(this.logger),
     ]);
 
     const allArticles: RawArticle[] = [];
@@ -180,6 +185,17 @@ export class ResearchAgent {
       sourceLabels.push('african_regulatory');
     }
 
+    // Multi-region (US, LATAM, Caribbean, research papers, BIS/IMF) — P3.7
+    if (multiRegionResult.status === 'fulfilled' && multiRegionResult.value.length > 0) {
+      // FetchedArticle and RawArticle have compatible fields for our use here
+      allArticles.push(...(multiRegionResult.value as any[]));
+      sourceLabels.push('multi_region');
+    } else if (multiRegionResult.status === 'rejected') {
+      this.logger.warn('[ResearchAgent] Multi-region fetch failed', {
+        reason: multiRegionResult.reason?.message,
+      });
+    }
+
     if (allArticles.length === 0) {
       this.logger.warn('[ResearchAgent] All sources returned empty — using NewsAggregationAgent fallback');
       return this.fallbackToNewsAggregationAgent();
@@ -204,11 +220,75 @@ export class ResearchAgent {
     const topic = top.title || 'African crypto markets update';
     const coreMessage = top.summary || top.description || `Breaking coverage: ${topic}`;
 
+    // P3.7 — region tally from scored articles for downstream regional routing.
+    // Computed early so the planner (P3.11) can use it.
+    const regionTally: Record<string, number> = {};
+    for (const a of scored) {
+      const r = (a as any).region;
+      if (r) regionTally[r] = (regionTally[r] || 0) + 1;
+    }
+
+    // P3.7 — narrative angles (Ollama). Best-effort; returns null on any
+    // failure so the pipeline keeps running with the existing single-angle flow.
+    const dedupedSources = this.deduplicateSources(sources);
+    let narrativeAngles: NarrativeAngles | null = await generateNarrativeAngles(
+      {
+        topic,
+        coreMessage,
+        sources: dedupedSources.slice(0, 8).map(s => ({
+          title: s.title,
+          domain: s.domain,
+          region: (s as any).region,
+        })),
+      },
+      this.logger,
+    );
+
+    // P3.11 — optional planner tool-use loop (Vercel AI SDK + Ollama).
+    // Gated by ENABLE_PLANNER_LOOP=true; off by default so a slow/missing
+    // model never blocks the existing static-source flow.
+    const plan = await planResearch(
+      {
+        topic,
+        coreMessage,
+        regions: Object.keys(regionTally),
+        existingUrls: dedupedSources.map(s => s.url),
+      },
+      this.logger,
+    );
+    let extraSources: Source[] = [];
+    let extraFacts: string[] = [];
+    if (plan) {
+      extraSources = plan.additionalSources.map(s => ({
+        url: s.url,
+        title: s.title || s.url,
+        published_at: new Date(),
+        credibility_score: 80,
+        domain: this.extractDomainFromUrl(s.url),
+      }));
+      extraFacts = plan.keyClaims;
+      // If the planner produced angles AND the narrative-angle pass didn't, use the planner's.
+      if (!narrativeAngles && (plan.suggestedAngles.positive || plan.suggestedAngles.negative)) {
+        narrativeAngles = {
+          positive: plan.suggestedAngles.positive,
+          negative: plan.suggestedAngles.negative,
+          regional_relevance: [],
+        };
+      }
+      this.logger.info(
+        `[ResearchAgent] planner enriched outcome: +${extraSources.length} sources, +${extraFacts.length} claims (${plan.toolCallCount} tool calls)`,
+      );
+    }
+
+    // P3.11 — merge planner contributions into the returned outcome.
+    const mergedSources = this.deduplicateSources([...dedupedSources, ...extraSources]);
+    const mergedFacts = this.deduplicateFacts([...facts, ...extraFacts]);
+
     return {
       id: `research_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
       topic,
-      sources: this.deduplicateSources(sources),
-      facts: this.deduplicateFacts(facts),
+      sources: mergedSources,
+      facts: mergedFacts,
       core_message: coreMessage,
       word_count: 1200,
       sentiment: this.aggregateSentiment(scored),
@@ -216,12 +296,31 @@ export class ResearchAgent {
       trending_score: Math.min(99, 50 + scored.length * 3),
       timestamp: new Date(),
       raw_data: {
-        source_labels: sourceLabels,
+        source_labels: [...sourceLabels, ...(plan ? ['planner_loop'] : [])],
         total_articles: allArticles.length,
         deduped_count: deduped.length,
         scored_count: scored.length,
+        region_tally: regionTally,
+        planner: plan
+          ? {
+              tool_calls: plan.toolCallCount,
+              added_sources: extraSources.length,
+              added_claims: extraFacts.length,
+              reasoning: plan.reasoning,
+            }
+          : null,
       },
-    };
+      narrative_angles: narrativeAngles ?? undefined,
+    } as ResearchOutcome;
+  }
+
+  /** Bare-domain extractor used for planner-added sources that lack a domain field. */
+  private extractDomainFromUrl(url: string): string {
+    try {
+      return new URL(url).hostname.replace(/^www\./, '');
+    } catch {
+      return '';
+    }
   }
 
   // =========================================================================

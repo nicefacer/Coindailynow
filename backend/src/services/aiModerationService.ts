@@ -824,7 +824,13 @@ export class AIModerationService {
     const reputation = await this.prisma.userReputation.findUnique({
       where: { userId }
     });
+    return this.mapReputationData(reputation);
+  }
 
+  /**
+   * Map Prisma reputation record to UserReputationData
+   */
+  private mapReputationData(reputation: any): UserReputationData {
     if (!reputation) {
       // Return default reputation for new users
       return {
@@ -1538,7 +1544,7 @@ export class AIModerationService {
    * Calculate user's priority tier based on role, subscription, and account age
    */
   async calculateUserPriorityTier(userId: string): Promise<PriorityTierInfo> {
-    // Fetch user data with role and subscription
+    // Fetch user data with role, subscription and reputation
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: {
@@ -1546,7 +1552,8 @@ export class AIModerationService {
           include: {
             SubscriptionPlan: true
           }
-        }
+        },
+        UserReputation: true
       }
     });
 
@@ -1554,6 +1561,13 @@ export class AIModerationService {
       throw new Error('User not found');
     }
 
+    return this.calculateTierFromUserData(user);
+  }
+
+  /**
+   * Internal method to calculate tier from pre-fetched user data
+   */
+  private calculateTierFromUserData(user: any): PriorityTierInfo {
     // Tier 1: Super Admin
     if (user.role === 'SUPER_ADMIN') {
       return {
@@ -1610,7 +1624,7 @@ export class AIModerationService {
 
     // Tier 4: Free Users (by account age)
     const accountAgeInDays = Math.floor(
-      (Date.now() - user.createdAt.getTime()) / (1000 * 60 * 60 * 24)
+      (Date.now() - (user.createdAt instanceof Date ? user.createdAt.getTime() : new Date(user.createdAt).getTime())) / (1000 * 60 * 60 * 24)
     );
 
     let priorityScore = 30;
@@ -1635,7 +1649,7 @@ export class AIModerationService {
     }
 
     // Adjust for user reputation
-    const reputation = await this.getUserReputation(userId);
+    const reputation = this.mapReputationData(user.UserReputation);
     if (reputation.trustLevel === 'HIGH') {
       priorityScore += 10;
       visibilityBoost += 5;
@@ -1752,12 +1766,21 @@ export class AIModerationService {
   ): Promise<Array<{ userId: string; tierInfo: PriorityTierInfo }>> {
     let users;
 
+    const include = {
+      Subscription: {
+        include: {
+          SubscriptionPlan: true
+        }
+      },
+      UserReputation: true
+    };
+
     if (tierName === 'SUPER_ADMIN') {
       users = await this.prisma.user.findMany({
         where: { role: 'SUPER_ADMIN' },
         take: limit,
         skip: offset,
-        select: { id: true }
+        include
       });
     } else if (tierName === 'ADMIN') {
       users = await this.prisma.user.findMany({
@@ -1766,7 +1789,7 @@ export class AIModerationService {
         },
         take: limit,
         skip: offset,
-        select: { id: true }
+        include
       });
     } else if (tierName === 'PREMIUM') {
       users = await this.prisma.user.findMany({
@@ -1778,7 +1801,7 @@ export class AIModerationService {
         },
         take: limit,
         skip: offset,
-        select: { id: true }
+        include
       });
     } else {
       users = await this.prisma.user.findMany({
@@ -1794,16 +1817,14 @@ export class AIModerationService {
         },
         take: limit,
         skip: offset,
-        select: { id: true }
+        include
       });
     }
 
-    const usersWithTiers = await Promise.all(
-      users.map(async (user) => ({
-        userId: user.id,
-        tierInfo: await this.calculateUserPriorityTier(user.id)
-      }))
-    );
+    const usersWithTiers = users.map((user: any) => ({
+      userId: user.id,
+      tierInfo: this.calculateTierFromUserData(user)
+    }));
 
     return usersWithTiers;
   }

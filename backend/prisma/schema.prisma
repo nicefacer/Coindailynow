@@ -10747,3 +10747,201 @@ model MarketplaceReview {
   @@index([productId])
   @@map("marketplace_reviews")
 }
+
+// ============================================================================
+// AI EDITORIAL PIPELINE — RUN & STEP PERSISTENCE
+// Captures the 12-step orchestrateArticleCreation flow so any step can be
+// inspected, re-run, or edited by a human-in-loop editor.
+// Lives alongside (not replacing) ContentPipeline/WorkflowStep — those are
+// scoped to a published Article; PipelineRun exists *before* an Article does.
+// ============================================================================
+
+model PipelineRun {
+  id          String         @id @default(cuid())
+  topic       String
+  status      String         @default("RUNNING") // RUNNING | READY_FOR_REVIEW | SUBMITTED_FOR_REVIEW | APPROVED | REJECTED | FAILED
+  articleId   String?        // set when the run is approved and an Article row is created
+  isMockMode  Boolean        @default(false)
+  docState    Bytes?         // Y.Doc binary update log for collab editor (W3); null until READY_FOR_REVIEW
+  docJson     Json?          // Tiptap JSON snapshot (kept in sync with docState on each save)
+  errorMessage String?
+
+  // P4.1 — provenance: where the run was seeded from
+  seedSource  String?        // user_trigger | gov_alert_auto | gov_alert_promote
+  seedMeta    Json?
+
+  // P4.6 — approval workflow
+  submittedForReviewAt DateTime?
+  submittedById        String?
+  approvedAt           DateTime?
+  approvedById         String?
+
+  // P4.3 — aggregated cost & timing (denormalized from steps for cheap list queries)
+  totalDurationMs Int?
+  totalTokens     Int?
+  totalCostUsd    Decimal?     @db.Decimal(10, 6)
+
+  // P4.2 — scheduling
+  scheduledPublishAt DateTime?
+
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  steps       PipelineStep[]
+
+  @@index([status, createdAt])
+  @@index([articleId])
+  @@index([submittedForReviewAt])
+  @@map("pipeline_runs")
+}
+
+model PipelineStep {
+  id           String      @id @default(cuid())
+  runId        String
+  stepName     String      // research | validateResearch | factCheck | writingPrompt | writer | validateArticle | imagePrompt | image | validateImage | embedImage | translationPrompts | translate | validateTranslations
+  stepOrder    Int
+  status       String      @default("PENDING") // PENDING | RUNNING | SUCCESS | FAILED | SKIPPED | STALE
+  input        Json?
+  output       Json?
+  errorMessage String?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  durationMs   Int?
+  // P4.3 — per-step telemetry: tokens, cost, tool calls
+  metrics      Json?
+  run          PipelineRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, stepName])
+  @@index([runId, stepOrder])
+  @@index([status])
+  @@map("pipeline_steps")
+}
+
+// P3.10 — per-language Y.Doc state for translation editors.
+// Each row is one (run, language) pair. Hocuspocus loads docState on connect,
+// writes back on every change. docJson is a Tiptap JSON snapshot kept in sync
+// so non-realtime consumers (lists, exports, approve flow) can read it.
+model PipelineTranslationDoc {
+  id        String   @id @default(cuid())
+  runId     String
+  langCode  String
+  docState  Bytes?
+  docJson   Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([runId, langCode])
+  @@index([runId])
+  @@map("pipeline_translation_docs")
+}
+
+// ============================================================================
+// VIDEO PIPELINE (P6)
+// One Article → one VideoRun → produces a short (60s vertical) + a long
+// (3-5 min landscape) video asset. Mirrors PipelineRun/PipelineStep shape
+// so the admin review UX is recognisable.
+// ============================================================================
+
+model VideoRun {
+  id          String       @id @default(cuid())
+  articleId   String       // parent Article
+  status      String       @default("RUNNING") // RUNNING | READY_FOR_REVIEW | APPROVED | REJECTED | FAILED
+  errorMessage String?
+  totalDurationMs Int?
+  totalCostUsd    Decimal?    @db.Decimal(10, 6)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  steps       VideoStep[]
+  assets      VideoAsset[]
+
+  @@index([articleId])
+  @@index([status, createdAt])
+  @@map("video_runs")
+}
+
+model VideoStep {
+  id           String   @id @default(cuid())
+  runId        String
+  stepName     String   // script | validateScript | voiceover | shortVideo | longVideo | broll | compose | validateVideo | queueForReview
+  stepOrder    Int
+  status       String   @default("PENDING") // PENDING | RUNNING | SUCCESS | FAILED | STALE
+  input        Json?
+  output       Json?
+  metrics      Json?
+  errorMessage String?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  durationMs   Int?
+  run          VideoRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, stepName])
+  @@index([runId, stepOrder])
+  @@map("video_steps")
+}
+
+model VideoAsset {
+  id          String   @id @default(cuid())
+  runId       String
+  format      String   // SHORT | LONG | BROLL
+  url         String
+  durationSec Int?
+  width       Int?
+  height      Int?
+  fileSize    Int?
+  thumbnailUrl String?
+  captionsUrl String?
+  provider    String?  // d-id | invideo | fal | composed
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  run         VideoRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@index([format])
+  @@map("video_assets")
+}
+
+// ============================================================================
+// DISTRIBUTION (P7)
+// DistributionTarget = configured social platform connection (per platform,
+// per CoinDaily account). DistributionPost = a published item on a target,
+// with metrics. Item can be an article, a video asset, or an image.
+// ============================================================================
+
+model DistributionTarget {
+  id          String   @id @default(cuid())
+  platform    String   // youtube | tiktok | instagram | x | facebook | linkedin | telegram | whatsapp
+  handle      String   // visible username / page id
+  authMode    String   @default("oauth") // oauth | api_key | bot_token
+  authState   Json?    // refresh tokens, access tokens, expirations (encrypted at rest in prod)
+  enabled     Boolean  @default(true)
+  metadata    Json?    // platform-specific fields (channel id, page id, ...)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  posts       DistributionPost[]
+
+  @@unique([platform, handle])
+  @@index([platform, enabled])
+  @@map("distribution_targets")
+}
+
+model DistributionPost {
+  id              String   @id @default(cuid())
+  targetId        String
+  itemType        String   // article | video | image
+  itemId          String   // Article.id, VideoAsset.id, or image id (matches our existing image system)
+  externalId      String?  // platform's id for the post (used to fetch metrics)
+  externalUrl     String?
+  status          String   @default("PENDING") // PENDING | POSTED | FAILED | DELETED
+  errorMessage    String?
+  postedAt        DateTime?
+  lastMetricsAt   DateTime?
+  metrics         Json?    // { views, likes, shares, comments, ... }
+  metadata        Json?    // platform-specific echo
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  target          DistributionTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@index([targetId, status])
+  @@index([itemType, itemId])
+  @@index([postedAt])
+  @@map("distribution_posts")
+}

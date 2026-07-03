@@ -1010,9 +1010,12 @@ Return ONLY a JSON array of 3 suggested queries, nothing else. Example: ["query 
         },
       });
 
+      // Create a map for faster lookup
+      const articleMap = new Map(articles.map(a => [a.id, a]));
+
       // Map to search results
       const results = translations.map(t => {
-        const article = articles.find(a => a.id === t.articleId);
+        const article = articleMap.get(t.articleId);
         if (!article) return null;
         const result = this.mapArticleToSearchResult(article, query);
         result.language = t.languageCode;

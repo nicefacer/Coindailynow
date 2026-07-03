@@ -1235,20 +1235,25 @@ async function calculateAgentTrends(agentId: string, dateRange?: DateRangeFilter
 }
 
 async function calculateCostByAgent(): Promise<CostBreakdown['byAgent']> {
-  const agents = await prisma.aIAgent.findMany();
+  const agents = await prisma.aIAgent.findMany({
+    include: {
+      AITask: {
+        where: {
+          actualCost: { not: null },
+        },
+        select: {
+          actualCost: true,
+          status: true,
+        },
+      },
+    },
+  });
   const result: CostBreakdown['byAgent'] = [];
 
   let totalSystemCost = 0;
 
   for (const agent of agents) {
-    const tasks = await prisma.aITask.findMany({
-      where: {
-        agentId: agent.id,
-        actualCost: { not: null },
-      },
-      select: { actualCost: true, status: true },
-    });
-
+    const tasks = (agent as any).AITask || [];
     const totalCost = tasks.reduce((sum, t) => sum + (t.actualCost || 0), 0);
     const tasksCompleted = tasks.filter(t => t.status === 'COMPLETED').length;
     const averageCostPerTask = tasksCompleted > 0 ? totalCost / tasksCompleted : 0;

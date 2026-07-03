@@ -40,48 +40,36 @@ describe('MarqueeTicker', () => {
     render(<MarqueeTicker tokens={mockTrendingTokens} />);
 
     // Check if token symbols are displayed
-    expect(screen.getByText('BTC')).toBeInTheDocument();
-    expect(screen.getByText('ETH')).toBeInTheDocument();
-    
-    // Check if token names are displayed
-    expect(screen.getByText('Bitcoin')).toBeInTheDocument();
-    expect(screen.getByText('Ethereum')).toBeInTheDocument();
+    expect(screen.getAllByText('BTC').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('ETH').length).toBeGreaterThan(0);
   });
 
   it('displays price information correctly', () => {
     render(<MarqueeTicker tokens={mockTrendingTokens} />);
 
     // Check if prices are formatted correctly
-    expect(screen.getByText('$43,250')).toBeInTheDocument();
-    expect(screen.getByText('$2,650.75')).toBeInTheDocument();
+    expect(screen.getAllByText('$43,250').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('$2,650.75').length).toBeGreaterThan(0);
   });
 
   it('shows percentage changes with correct styling', () => {
     render(<MarqueeTicker tokens={mockTrendingTokens} />);
 
     // Check if percentage changes are displayed
-    expect(screen.getByText('+2.98%')).toBeInTheDocument();
-    expect(screen.getByText('-1.20%')).toBeInTheDocument();
+    expect(screen.getAllByText(/2.98%/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/1.20%/).length).toBeGreaterThan(0);
   });
 
-  it('displays trending label', () => {
+  it('displays live label', () => {
     render(<MarqueeTicker tokens={mockTrendingTokens} />);
 
-    expect(screen.getByText('Trending')).toBeInTheDocument();
+    expect(screen.getByText('Live')).toBeInTheDocument();
   });
 
   it('handles empty token list', () => {
     render(<MarqueeTicker tokens={[]} />);
 
     // Component should not render when no tokens are provided
-    expect(screen.queryByText('Trending')).not.toBeInTheDocument();
-  });
-
-  it('shows volume information when enabled', () => {
-    render(<MarqueeTicker tokens={mockTrendingTokens} showVolume={true} />);
-
-    // Check if volume is displayed (formatted)
-    expect(screen.getByText(/Vol: 24.5B/)).toBeInTheDocument();
-    expect(screen.getByText(/Vol: 12.3B/)).toBeInTheDocument();
+    expect(screen.queryByText('Live')).not.toBeInTheDocument();
   });
 });

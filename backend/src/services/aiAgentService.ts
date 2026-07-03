@@ -11,6 +11,7 @@
  * - Redis caching for optimal performance
  */
 
+import { AIAgent } from '@prisma/client';
 import prisma from '../lib/prisma';
 import { redisClient } from '../config/redis';
 import { logger } from '../utils/logger';
@@ -346,13 +347,15 @@ export async function deactivateAIAgent(id: string) {
  * Update agent performance metrics
  * @param agentId - Agent ID
  * @param metrics - Partial metrics to update
+ * @param existingAgent - Optional existing agent object to avoid redundant DB lookup
  */
 export async function updateAgentMetrics(
   agentId: string,
-  metrics: Partial<PerformanceMetrics>
+  metrics: Partial<PerformanceMetrics>,
+  existingAgent?: AIAgent
 ) {
   try {
-    const agent = await prisma.aIAgent.findUnique({ where: { id: agentId } });
+    const agent = existingAgent || await prisma.aIAgent.findUnique({ where: { id: agentId } });
     if (!agent) {
       throw new Error(`Agent not found: ${agentId}`);
     }
@@ -680,11 +683,13 @@ export function startMetricsUpdateTask() {
         where: { isActive: true },
       });
 
-      for (const agent of agents) {
-        // Update health check timestamp
-        await updateAgentMetrics(agent.id, {
-          lastHealthCheck: new Date(),
-        });
+      if (agents.length > 0) {
+        const now = new Date();
+        await Promise.all(
+          agents.map((agent) =>
+            updateAgentMetrics(agent.id, { lastHealthCheck: now }, agent)
+          )
+        );
       }
 
       logger.debug(`Metrics updated for ${agents.length} active agents`);
